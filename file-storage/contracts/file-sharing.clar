@@ -69,30 +69,32 @@
 
 ;; Private Functions
 (define-private (is-file-owner (file-id uint))
-    (let ((file-record (unwrap! (map-get? file-records { file-id: file-id }) ERR-NOT-FOUND)))
-        (is-eq (get owner file-record) tx-sender)
+    (match (map-get? file-records { file-id: file-id })
+        file-record (is-eq (get owner file-record) tx-sender)
+        false
     )
 )
 
 (define-private (has-file-access (file-id uint) (user principal))
-    (let (
-        (file-record (unwrap! (map-get? file-records { file-id: file-id }) ERR-NOT-FOUND))
-        (access-entry (map-get? file-access-permissions { file-id: file-id, user: user }))
-    )
-        (or 
-            (is-eq (get owner file-record) user)
-            (not (get is-private file-record))
-            (and 
-                (is-some access-entry)
-                (get can-access (unwrap! access-entry false))
-                (let ((expiration-time (get access-expiration-timestamp (unwrap! access-entry false))))
-                    (or
-                        (is-none expiration-time)
-                        (> (unwrap! expiration-time u0) block-height)
+    (match (map-get? file-records { file-id: file-id })
+        file-record 
+            (let ((access-entry (map-get? file-access-permissions { file-id: file-id, user: user })))
+                (or 
+                    (is-eq (get owner file-record) user)
+                    (not (get is-private file-record))
+                    (match access-entry
+                        permission (and 
+                            (get can-access permission)
+                            (match (get access-expiration-timestamp permission)
+                                expiry-time (> expiry-time block-height)
+                                true  ;; if no expiry time, access is valid
+                            )
+                        )
+                        false
                     )
                 )
             )
-        )
+        false
     )
 )
 
@@ -102,12 +104,21 @@
             { total-files-count: u0, total-storage-used: u0, last-upload-timestamp: u0 }
             (map-get? user-storage-stats { user: user })
         ))
+        (new-total-files (+ (get total-files-count current-stats) u1))
+        (new-storage-used (+ (get total-storage-used current-stats) 
+            (if (> size-change 0) 
+                (to-uint size-change) 
+                (if (>= (get total-storage-used current-stats) (to-uint (if (< size-change 0) (- 0 size-change) size-change)))
+                    (to-uint (if (< size-change 0) (- 0 size-change) size-change))
+                    u0
+                )
+            )))
     )
         (map-set user-storage-stats
             { user: user }
             {
-                total-files-count: (+ (get total-files-count current-stats) u1),
-                total-storage-used: (+ (get total-storage-used current-stats) (if (> size-change 0) (to-uint size-change) u0)),
+                total-files-count: new-total-files,
+                total-storage-used: new-storage-used,
                 last-upload-timestamp: block-height
             }
         )
@@ -176,36 +187,37 @@
     (new-file-size uint)
     (change-description (string-ascii 256))
 )
-    (let (
-        (file-record (unwrap! (map-get? file-records { file-id: file-id }) ERR-NOT-FOUND))
-        (new-version-number (+ (get version-number file-record) u1))
-    )
-        (asserts! (or (is-file-owner file-id) (has-edit-permission file-id tx-sender)) ERR-UNAUTHORIZED)
-        (asserts! (<= new-file-size maximum-file-size) ERR-INVALID-INPUT)
-        
-        (map-set file-records
-            { file-id: file-id }
-            (merge file-record {
-                file-hash: new-file-hash,
-                file-size: new-file-size,
-                last-modified-timestamp: block-height,
-                version-number: new-version-number
-            })
-        )
-        
-        (map-set file-version-history
-            { file-id: file-id, version-number: new-version-number }
-            {
-                file-hash: new-file-hash,
-                file-size: new-file-size,
-                modified-by-user: tx-sender,
-                modification-timestamp: block-height,
-                change-description: change-description
-            }
-        )
-        
-        (update-user-storage-stats (get owner file-record) (- (to-int new-file-size) (to-int (get file-size file-record))))
-        (ok new-version-number)
+    (match (map-get? file-records { file-id: file-id })
+        file-record
+            (let ((new-version-number (+ (get version-number file-record) u1)))
+                (asserts! (or (is-file-owner file-id) (has-edit-permission file-id tx-sender)) ERR-UNAUTHORIZED)
+                (asserts! (<= new-file-size maximum-file-size) ERR-INVALID-INPUT)
+                
+                (map-set file-records
+                    { file-id: file-id }
+                    (merge file-record {
+                        file-hash: new-file-hash,
+                        file-size: new-file-size,
+                        last-modified-timestamp: block-height,
+                        version-number: new-version-number
+                    })
+                )
+                
+                (map-set file-version-history
+                    { file-id: file-id, version-number: new-version-number }
+                    {
+                        file-hash: new-file-hash,
+                        file-size: new-file-size,
+                        modified-by-user: tx-sender,
+                        modification-timestamp: block-height,
+                        change-description: change-description
+                    }
+                )
+                
+                (update-user-storage-stats (get owner file-record) (- (to-int new-file-size) (to-int (get file-size file-record))))
+                (ok new-version-number)
+            )
+        ERR-NOT-FOUND
     )
 )
 
@@ -236,34 +248,38 @@
     (new-file-description (optional (string-ascii 256)))
     (new-file-tags (optional (list 10 (string-ascii 32))))
 )
-    (let ((file-record (unwrap! (map-get? file-records { file-id: file-id }) ERR-NOT-FOUND)))
-        (asserts! (is-file-owner file-id) ERR-UNAUTHORIZED)
-        
-        (if (is-some new-file-name)
-            (map-set file-records
-                { file-id: file-id }
-                (merge file-record { file-name: (unwrap! new-file-name "") })
+    (match (map-get? file-records { file-id: file-id })
+        file-record
+            (begin
+                (asserts! (is-file-owner file-id) ERR-UNAUTHORIZED)
+                
+                (if (is-some new-file-name)
+                    (map-set file-records
+                        { file-id: file-id }
+                        (merge file-record { file-name: (unwrap! new-file-name ERR-INVALID-INPUT) })
+                    )
+                    true
+                )
+                
+                (if (is-some new-file-description)
+                    (map-set file-records
+                        { file-id: file-id }
+                        (merge file-record { file-description: (unwrap! new-file-description ERR-INVALID-INPUT) })
+                    )
+                    true
+                )
+                
+                (if (is-some new-file-tags)
+                    (map-set file-tag-associations
+                        { file-id: file-id }
+                        { tag-list: (unwrap! new-file-tags ERR-INVALID-INPUT) }
+                    )
+                    true
+                )
+                
+                (ok true)
             )
-            true
-        )
-        
-        (if (is-some new-file-description)
-            (map-set file-records
-                { file-id: file-id }
-                (merge file-record { file-description: (unwrap! new-file-description "") })
-            )
-            true
-        )
-        
-        (if (is-some new-file-tags)
-            (map-set file-tag-associations
-                { file-id: file-id }
-                { tag-list: (unwrap! new-file-tags (list)) }
-            )
-            true
-        )
-        
-        (ok true)
+        ERR-NOT-FOUND
     )
 )
 
@@ -275,32 +291,22 @@
 )
 
 (define-read-only (has-edit-permission (file-id uint) (user principal))
-    (let ((access-entry (map-get? file-access-permissions { file-id: file-id, user: user })))
-        (and
-            (is-some access-entry)
-            (get can-edit (unwrap! access-entry false))
-            (let ((expiration-time (get access-expiration-timestamp (unwrap! access-entry false))))
-                (or
-                    (is-none expiration-time)
-                    (> (unwrap! expiration-time u0) block-height)
-                )
+    (match (map-get? file-access-permissions { file-id: file-id, user: user })
+        permission (and
+            (get can-edit permission)
+            (match (get access-expiration-timestamp permission)
+                expiry-time (> expiry-time block-height)
+                true  ;; if no expiry time, permission is valid
             )
         )
+        false
     )
 )
 
-(define-read-only (search-files-by-tag (search-tag (string-ascii 32)))
-    (filter
-        (lambda (file-id)
-            (let ((tags-entry (map-get? file-tag-associations { file-id: file-id })))
-                (and
-                    (is-some tags-entry)
-                    (is-some (index-of (get tag-list (unwrap! tags-entry { tag-list: (list) })) search-tag))
-                    (has-file-access file-id tx-sender)
-                )
-            )
-        )
-        (map-keys file-records)
+(define-read-only (get-file-details (file-id uint))
+    (begin
+        (asserts! (has-file-access file-id tx-sender) ERR-UNAUTHORIZED)
+        (ok (map-get? file-records { file-id: file-id }))
     )
 )
 
