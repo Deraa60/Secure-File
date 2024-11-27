@@ -11,6 +11,8 @@
 ;; Storage Constants
 (define-constant maximum-file-size u1073741824) ;; 1GB in bytes
 (define-constant maximum-files-per-user u100)
+(define-constant minimum-file-name-length u1)
+(define-constant minimum-description-length u1)
 
 ;; Data Maps
 (define-map file-records 
@@ -75,6 +77,43 @@
     )
 )
 
+(define-private (validate-file-id (file-id uint))
+    (match (map-get? file-records { file-id: file-id })
+        file-record (ok true)
+        ERR-NOT-FOUND
+    )
+)
+
+(define-private (validate-user (user principal))
+    (if (is-eq user contract-owner)
+        ERR-INVALID-INPUT
+        (ok true)
+    )
+)
+
+(define-private (validate-file-name (file-name (string-ascii 64)))
+    (if (>= (len file-name) minimum-file-name-length)
+        (ok true)
+        ERR-INVALID-INPUT
+    )
+)
+
+(define-private (validate-file-description (description (string-ascii 256)))
+    (if (>= (len description) minimum-description-length)
+        (ok true)
+        ERR-INVALID-INPUT
+    )
+)
+
+(define-private (validate-expiry-time (expiry-time (optional uint)))
+    (match expiry-time
+        time (if (> time block-height)
+            (ok true)
+            ERR-INVALID-INPUT)
+        (ok true)
+    )
+)
+
 (define-private (has-file-access (file-id uint) (user principal))
     (match (map-get? file-records { file-id: file-id })
         file-record 
@@ -87,13 +126,26 @@
                             (get can-access permission)
                             (match (get access-expiration-timestamp permission)
                                 expiry-time (> expiry-time block-height)
-                                true  ;; if no expiry time, access is valid
+                                true
                             )
                         )
                         false
                     )
                 )
             )
+        false
+    )
+)
+
+(define-private (has-edit-permission (file-id uint) (user principal))
+    (match (map-get? file-access-permissions { file-id: file-id, user: user })
+        permission (and
+            (get can-edit permission)
+            (match (get access-expiration-timestamp permission)
+                expiry-time (> expiry-time block-height)
+                true
+            )
+        )
         false
     )
 )
@@ -143,6 +195,9 @@
             (map-get? user-storage-stats { user: tx-sender })
         ))
     )
+        ;; Input validation
+        (try! (validate-file-name file-name))
+        (try! (validate-file-description file-description))
         (asserts! (<= file-size maximum-file-size) ERR-INVALID-INPUT)
         (asserts! (< (get total-files-count user-storage-info) maximum-files-per-user) ERR-STORAGE-LIMIT)
         
@@ -187,37 +242,42 @@
     (new-file-size uint)
     (change-description (string-ascii 256))
 )
-    (match (map-get? file-records { file-id: file-id })
-        file-record
-            (let ((new-version-number (+ (get version-number file-record) u1)))
-                (asserts! (or (is-file-owner file-id) (has-edit-permission file-id tx-sender)) ERR-UNAUTHORIZED)
-                (asserts! (<= new-file-size maximum-file-size) ERR-INVALID-INPUT)
-                
-                (map-set file-records
-                    { file-id: file-id }
-                    (merge file-record {
-                        file-hash: new-file-hash,
-                        file-size: new-file-size,
-                        last-modified-timestamp: block-height,
-                        version-number: new-version-number
-                    })
+    (begin
+        (try! (validate-file-id file-id))
+        (try! (validate-file-description change-description))
+        
+        (match (map-get? file-records { file-id: file-id })
+            file-record
+                (let ((new-version-number (+ (get version-number file-record) u1)))
+                    (asserts! (or (is-file-owner file-id) (has-edit-permission file-id tx-sender)) ERR-UNAUTHORIZED)
+                    (asserts! (<= new-file-size maximum-file-size) ERR-INVALID-INPUT)
+                    
+                    (map-set file-records
+                        { file-id: file-id }
+                        (merge file-record {
+                            file-hash: new-file-hash,
+                            file-size: new-file-size,
+                            last-modified-timestamp: block-height,
+                            version-number: new-version-number
+                        })
+                    )
+                    
+                    (map-set file-version-history
+                        { file-id: file-id, version-number: new-version-number }
+                        {
+                            file-hash: new-file-hash,
+                            file-size: new-file-size,
+                            modified-by-user: tx-sender,
+                            modification-timestamp: block-height,
+                            change-description: change-description
+                        }
+                    )
+                    
+                    (update-user-storage-stats (get owner file-record) (- (to-int new-file-size) (to-int (get file-size file-record))))
+                    (ok new-version-number)
                 )
-                
-                (map-set file-version-history
-                    { file-id: file-id, version-number: new-version-number }
-                    {
-                        file-hash: new-file-hash,
-                        file-size: new-file-size,
-                        modified-by-user: tx-sender,
-                        modification-timestamp: block-height,
-                        change-description: change-description
-                    }
-                )
-                
-                (update-user-storage-stats (get owner file-record) (- (to-int new-file-size) (to-int (get file-size file-record))))
-                (ok new-version-number)
-            )
-        ERR-NOT-FOUND
+            ERR-NOT-FOUND
+        )
     )
 )
 
@@ -228,7 +288,11 @@
     (expiration-time (optional uint))
 )
     (begin
+        (try! (validate-file-id file-id))
+        (try! (validate-user user))
+        (try! (validate-expiry-time expiration-time))
         (asserts! (is-file-owner file-id) ERR-UNAUTHORIZED)
+        
         (map-set file-access-permissions
             { file-id: file-id, user: user }
             {
@@ -248,71 +312,81 @@
     (new-file-description (optional (string-ascii 256)))
     (new-file-tags (optional (list 10 (string-ascii 32))))
 )
-    (match (map-get? file-records { file-id: file-id })
-        file-record
-            (begin
-                (asserts! (is-file-owner file-id) ERR-UNAUTHORIZED)
-                
-                (if (is-some new-file-name)
-                    (map-set file-records
-                        { file-id: file-id }
-                        (merge file-record { file-name: (unwrap! new-file-name ERR-INVALID-INPUT) })
+    (begin
+        (try! (validate-file-id file-id))
+        
+        (match (map-get? file-records { file-id: file-id })
+            file-record
+                (begin
+                    (asserts! (is-file-owner file-id) ERR-UNAUTHORIZED)
+                    
+                    (match new-file-name
+                        file-name (try! (validate-file-name file-name))
+                        true
                     )
-                    true
-                )
-                
-                (if (is-some new-file-description)
-                    (map-set file-records
-                        { file-id: file-id }
-                        (merge file-record { file-description: (unwrap! new-file-description ERR-INVALID-INPUT) })
+                    
+                    (match new-file-description
+                        description (try! (validate-file-description description))
+                        true
                     )
-                    true
-                )
-                
-                (if (is-some new-file-tags)
-                    (map-set file-tag-associations
-                        { file-id: file-id }
-                        { tag-list: (unwrap! new-file-tags ERR-INVALID-INPUT) }
+                    
+                    (if (is-some new-file-name)
+                        (map-set file-records
+                            { file-id: file-id }
+                            (merge file-record { file-name: (unwrap! new-file-name ERR-INVALID-INPUT) })
+                        )
+                        true
                     )
-                    true
+                    
+                    (if (is-some new-file-description)
+                        (map-set file-records
+                            { file-id: file-id }
+                            (merge file-record { file-description: (unwrap! new-file-description ERR-INVALID-INPUT) })
+                        )
+                        true
+                    )
+                    
+                    (if (is-some new-file-tags)
+                        (map-set file-tag-associations
+                            { file-id: file-id }
+                            { tag-list: (unwrap! new-file-tags ERR-INVALID-INPUT) }
+                        )
+                        true
+                    )
+                    
+                    (ok true)
                 )
-                
-                (ok true)
-            )
-        ERR-NOT-FOUND
+            ERR-NOT-FOUND
+        )
     )
 )
 
 (define-read-only (get-file-version-history (file-id uint))
     (begin
+        (try! (validate-file-id file-id))
         (asserts! (has-file-access file-id tx-sender) ERR-UNAUTHORIZED)
         (ok (map-get? file-version-history { file-id: file-id, version-number: u1 }))
     )
 )
 
-(define-read-only (has-edit-permission (file-id uint) (user principal))
-    (match (map-get? file-access-permissions { file-id: file-id, user: user })
-        permission (and
-            (get can-edit permission)
-            (match (get access-expiration-timestamp permission)
-                expiry-time (> expiry-time block-height)
-                true  ;; if no expiry time, permission is valid
-            )
-        )
-        false
-    )
+(define-read-only (check-edit-permission (file-id uint) (user principal))
+    (ok (has-edit-permission file-id user))
 )
 
 (define-read-only (get-file-details (file-id uint))
     (begin
+        (try! (validate-file-id file-id))
         (asserts! (has-file-access file-id tx-sender) ERR-UNAUTHORIZED)
         (ok (map-get? file-records { file-id: file-id }))
     )
 )
 
 (define-read-only (get-user-storage-statistics (user principal))
-    (ok (default-to
-        { total-files-count: u0, total-storage-used: u0, last-upload-timestamp: u0 }
-        (map-get? user-storage-stats { user: user })
-    ))
+    (begin
+        (try! (validate-user user))
+        (ok (default-to
+            { total-files-count: u0, total-storage-used: u0, last-upload-timestamp: u0 }
+            (map-get? user-storage-stats { user: user })
+        ))
+    )
 )
